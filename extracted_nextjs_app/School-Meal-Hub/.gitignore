@@ -1,0 +1,9 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+# 업로드된 이미지 파일 제외 (.gitkeep은 유지)
+uploads/*
+!uploads/.gitkeep
