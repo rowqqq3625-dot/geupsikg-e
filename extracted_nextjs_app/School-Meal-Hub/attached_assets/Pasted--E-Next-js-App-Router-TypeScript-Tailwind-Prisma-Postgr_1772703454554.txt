@@ -1,0 +1,259 @@
+당신은 프로덕션 경험이 풍부한 시니어 풀스택 엔지니어입니다.
+우리는 급식E를 Next.js(App Router)+TypeScript+Tailwind+Prisma+Postgres로 개발 중이며,
+1단계(세션 쿠키 Auth, /dashboard 보호, /api/me, 기본 UI)와
+2단계(학교코드 매핑+NEIS 급식, 피드백→포인트, 반/학교 랭킹),
+3단계(클린플레이트 업로드+상태머신+관리자 승인+포인트 지급)까지 완료된 상태입니다.
+
+이제 “구현 4단계”를 설계하고 실제 코드를 수정/추가하여 완성하세요.
+4단계의 본질은 ‘기능 추가’가 아니라, 제품 원칙을 시스템으로 고정해 “입력은 더 줄고 개인화는 자동으로 더 커지며, 알림이 스팸이 아니라 습관을 만든다”를 구현하는 것입니다.
+
+=====================================================
+Δ2) 제품 원칙(반드시 코드/구조에 반영)
+=====================================================
+원칙: “입력 최소, 개인화 최대”
+- 가입/로그인 입력은 최소(필수만), 나머지 개인화는 백그라운드 자동 세팅 파이프라인으로 처리.
+- 사용자가 추가 입력(키/몸무게/목표 등)을 안 해도, 기본 개인화(급식/알림/집단 소속/랭킹 스코프)는 즉시 동작해야 함.
+- 알림은 ‘많이 보내기’가 아니라 ‘맞춤 빈도 자동 조절’이 핵심(스팸 방지).
+
+가입 즉시 내부 파이프라인(자동 세팅) 항목(반드시 구현):
+1) 학교명 → 학교코드 매핑/캐시 프리워밍
+   - (이미 2단계에 학교 매핑이 있다면) 가입 직후 해당 학교의 급식 데이터를 미리 캐시(예: 오늘~+5 영업일)
+2) 학년반 → 집단 소속 자동 부여
+   - 반/학년/학교 단위 ‘그룹 키’를 자동 생성해 랭킹/알림/통계에 재사용
+3) 목표/패턴 → 알림 빈도 자동 조절(스팸 방지)
+   - 사용자의 행동(앱 열기/알림 클릭/피드백 제출/인증 제출)을 기반으로 알림 강도를 자동 조절
+   - 하드 룰: “하루 최대 N회”, “조용한 시간(quiet hours)”, “최근 반응 없으면 감쇠”
+
+=====================================================
+스택(4단계 추가 선택 포함)
+=====================================================
+- 기존 스택 유지: Next.js App Router + TS + Tailwind + Prisma + Postgres + Zod + 세션 쿠키 Auth
+- 4단계에서 “백그라운드 작업(자동 세팅/캐시/알림 발송)”을 위해 잡/스케줄러를 도입한다.
+  - Redis 없이 Postgres만으로 가능한 방식 선호
+  - 예: pg-boss(추천) 또는 유사한 Postgres 기반 큐
+  - 로컬에서도 반드시 동작해야 하며, worker 프로세스를 별도 실행 가능해야 함
+- “푸시 알림”은 웹 기반으로 먼저 구현:
+  - Web Push(VAPID) + Service Worker + PushSubscription 저장
+  - 푸시 불가 환경에서도 동작하도록 “인앱 알림(Notification Center)”을 함께 구현(푸시=옵션, 인앱=기본)
+
+=====================================================
+[중요 출력 규칙]
+=====================================================
+- 장문 설명 금지. 바로 실행 가능한 산출물 중심으로 출력.
+- 반드시 포함:
+  1) 변경/추가 파일 트리
+  2) Prisma schema 변경 전체 코드 + migration 방법
+  3) 추가/수정된 핵심 파일 전체 코드(복붙 가능)
+  4) 로컬 실행/테스트 시나리오(짧게)
+- patch 형태 금지: 핵심 파일은 “완전한 코드”로 제시.
+- .env.example 포함(새 env 전부).
+- UI 톤: Apple-like 미니멀 (white/gray-50, hairline border, 절제된 blue, 여백/타이포 중심, 과한 shadow/animation 금지)
+
+=====================================================
+1) DB 모델(Prisma) — 4단계 추가/확장
+=====================================================
+A) UserSettings (또는 NotificationSettings) 테이블 추가
+- id (uuid)
+- userId (unique, relation)
+- timezone (string, default "Asia/Seoul")
+- quietHoursStart (int, default 22)   // 22시
+- quietHoursEnd (int, default 7)      // 7시
+- maxPushPerDay (int, default 2)
+- lunchReminderEnabled (boolean, default true)
+- lunchReminderTime (string, default "11:10") // HH:mm
+- adaptiveEnabled (boolean, default true)
+- createdAt, updatedAt
+
+B) PushSubscription 테이블 추가(Web Push)
+- id (uuid)
+- userId (relation)
+- endpoint (string, unique)
+- p256dh (string)
+- auth (string)
+- userAgent (string nullable)
+- createdAt, updatedAt
+- 목적: 사용자당 여러 기기/브라우저 구독 가능
+
+C) Notification 테이블 추가(인앱 알림 센터)
+- id (uuid)
+- userId (relation)
+- type enum: MEAL_REMINDER | CLEANPLATE_RESULT | WEEKLY_SUMMARY | SYSTEM
+- title (string)
+- body (string)
+- url (string nullable)    // 클릭 시 이동 (예: /dashboard, /cleanplate)
+- isRead (boolean default false)
+- sentAt (datetime)
+- createdAt
+- 인덱스: (userId, sentAt)
+
+D) UserEvent 테이블 추가(패턴 기반 자동조절용, 최소 버전)
+- id (uuid)
+- userId (relation)
+- type enum: APP_OPEN | NOTI_SENT | NOTI_CLICK | FEEDBACK_SUBMIT | CLEANPLATE_SUBMIT
+- meta (Json nullable)
+- createdAt
+- 인덱스: (userId, createdAt)
+
+E) AutoSetupJob 상태 기록(간단)
+- id (uuid)
+- userId (unique, relation)
+- status enum: PENDING | DONE | FAILED
+- lastError (string nullable)
+- updatedAt
+- 목적: 가입 직후 자동세팅이 재시도/관측 가능
+
+※ “집단 소속 자동 부여”는 별도 테이블 없이도 가능:
+- user의 schoolId + grade + classNum을 기반으로 groupKey를 서버에서 계산
+- 단, 재사용을 위해 helper 유틸로 표준화(예: "school:{id}:grade:{g}:class:{c}")
+- 확장 여지가 있으면 GroupMembership 테이블을 선택 구현해도 됨(필수 아님)
+
+=====================================================
+2) 자동 세팅 파이프라인(가입 직후 실행)
+=====================================================
+- 가입 성공 직후(또는 최초 로그인 직후) 다음을 백그라운드 잡으로 enqueue:
+  1) (학교코드 매핑이 이미 완료된 상태를 전제로) 급식 캐시 프리워밍:
+     - MealCache에 오늘~+5 영업일치 저장 시도(NEIS 호출 실패 시 mock 저장 금지, 실패는 기록만)
+  2) AutoSetupJob.status DONE 처리
+  3) 기본 알림 1개 생성(인앱):
+     - "설정 완료" 같은 과장 대신, 미니멀 메시지로: "알림 설정이 기본값으로 적용됐어요." (원하면 끌 수 있게 /settings로 링크)
+- 이 파이프라인은 “가입 입력 최소화”를 보완하는 핵심이므로 반드시 구현
+
+=====================================================
+3) 알림 시스템(푸시 + 인앱) — ‘스팸 방지’ 포함
+=====================================================
+A) 인앱 알림 센터(기본)
+- 알림을 보내야 하는 이벤트(예: 점심 리마인더, 클린플레이트 승인 결과, 주간 요약)는
+  먼저 Notification row를 생성하고,
+  푸시 권한/구독이 존재하면 추가로 web push를 발송한다.
+- 즉, “푸시 실패해도 인앱에는 남는다”가 원칙
+
+B) Web Push(옵션)
+- VAPID 키 기반으로 구현
+- 클라이언트는 service worker 등록 + permission 획득 + subscription 생성 후 서버에 저장
+- 서버는 /api/push/subscribe로 subscription 저장
+- VAPID_PRIVATE_KEY 등 민감값은 서버에만 존재
+
+C) 스팸 방지(필수 룰 + 적응형)
+하드 룰(강제):
+- quiet hours(기본 22~07)에는 푸시 발송 금지(인앱만 저장 가능)
+- 하루 maxPushPerDay 초과 발송 금지
+- 동일 타입 알림(점심 리마인더)은 하루 1회만
+
+적응형 룰(자동 빈도 조절, 최소 구현):
+- 최근 3회 MEAL_REMINDER 푸시를 보냈는데 NOTI_CLICK이 0이면
+  lunchReminderEnabled를 유지하되 “푸시 발송 빈도”를 감쇠(예: 주 3회로)
+- 최근 7일 APP_OPEN이 충분(예: 4일 이상)하면 기본 매일 유지
+- 이 로직은 서버 유틸로 분리: src/server/notification-policy.ts
+- 정책 결과는 UserSettings에 저장(또는 계산 캐시)
+
+=====================================================
+4) API 라우트(백엔드) — 4단계 필수
+=====================================================
+A) POST /api/auto-setup/run (내부용)
+- 세션 사용자 기준으로 AutoSetupJob이 PENDING이면 enqueue
+- 이미 DONE이면 no-op
+- (실제로는 signup 후 자동 호출되지만, 개발/디버깅용으로 존재)
+
+B) GET/PUT /api/settings
+- GET: UserSettings 반환
+- PUT: lunchReminderEnabled, lunchReminderTime, quietHours, maxPushPerDay 등 수정
+- Zod 검증, 최소 입력 UX
+
+C) POST /api/push/subscribe
+- body: PushSubscription payload(endpoint, keys.p256dh, keys.auth)
+- 저장(upsert), userAgent 기록(optional)
+
+D) POST /api/push/unsubscribe
+- endpoint로 삭제 또는 현재 사용자 구독 전체 삭제 옵션
+
+E) GET /api/notifications?cursor=...
+- 인앱 알림 페이징 반환(최근순)
+- 응답에 unreadCount 포함
+
+F) POST /api/notifications/read
+- 특정 id 또는 all 읽음 처리
+
+G) (스케줄/잡 실행) /api/jobs/tick (개발용/로컬용)
+- worker가 주기적으로 처리할 수 있게 설계하되,
+  로컬에서는 간단히 “tick 호출”로도 실행 가능하게 제공
+- 단, 프로덕션에서는 worker 프로세스가 주도하도록 구조 분리
+
+=====================================================
+5) 스케줄러/워커(필수)
+=====================================================
+- src/worker/index.ts (또는 src/worker.ts) 생성
+- 실행: npm run worker
+- 수행 작업(최소):
+  1) 매일 점심 리마인더 스케줄(사용자별 UserSettings 기반)
+  2) 알림 발송 전 스팸 룰/적응형 룰 적용
+  3) MealCache 프리워밍 잡 수행(가입 직후 또는 매일 새벽 1회 학교 단위)
+- 로컬/개발에서 반드시 재현 가능해야 함
+- 서버리스 제약을 피하기 위해 “worker 분리”가 원칙
+
+=====================================================
+6) 프론트엔드(UI) — ‘입력 최소, 개인화 최대’를 체감시키기
+=====================================================
+A) /signup, /login
+- 추가 입력을 늘리지 말 것(입력 최소 유지)
+- 단, 가입 성공 후 자동 세팅이 도는 동안 UX:
+  - “완료” 같은 과장 대신, 미니멀 로딩 상태 + 완료 후 대시보드 이동
+  - 자동 세팅은 백그라운드라 대시보드 진입을 막지 않되, 인앱 알림으로 “기본 설정 적용됨” 안내
+
+B) /dashboard
+- 상단에 Bell(알림) 아이콘 + unread badge(절제되게)
+- “점심 알림 켜기/끄기” 같은 토글을 대시보드에 작은 링크로 제공하거나 /settings로 연결
+
+C) /notifications 페이지 신규(로그인 필요)
+- 인앱 알림 리스트(미니멀)
+- 읽음 처리, 클릭 시 url로 이동
+
+D) /settings 페이지 신규(로그인 필요)
+- 입력 최소 원칙에 따라 “정말 필요한 설정만” 제공:
+  - 점심 알림 on/off
+  - 점심 알림 시간
+  - 조용한 시간(기본값 제공)
+- 설명 텍스트는 짧고 담백하게(애플식)
+
+E) PWA / Service Worker
+- public/sw.js (또는 next-pwa 없이 수동 최소 구현)
+- 구독 버튼은 /settings에서 “알림 허용” 1개로 제공(복잡한 온보딩 금지)
+
+=====================================================
+7) 반드시 출력할 산출물
+=====================================================
+- 변경된 prisma/schema.prisma 전체
+- .env.example 전체(기존 + VAPID + 큐/워커 관련 env)
+  - VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, APP_BASE_URL 등
+- worker 파일 전체 + npm scripts 추가(package.json)
+- server 유틸:
+  - src/server/notification.ts (인앱 생성 + web push 발송)
+  - src/server/notification-policy.ts (적응형 빈도)
+  - src/server/group-key.ts (집단 소속 키 표준)
+- API route 전체 코드:
+  - /api/settings (GET/PUT)
+  - /api/push/subscribe, /api/push/unsubscribe
+  - /api/notifications (GET), /api/notifications/read (POST)
+  - /api/auto-setup/run
+  - /api/jobs/tick (개발용)
+- 프론트 페이지 전체 코드:
+  - /notifications
+  - /settings
+  - /dashboard 수정본(벨 아이콘/배지/링크)
+- 로컬 실행/테스트 시나리오(짧게)
+
+=====================================================
+8) 로컬 실행/테스트 시나리오(짧게)
+=====================================================
+- docker compose up (postgres + (기존 minio가 있으면 유지))
+- prisma migrate dev + prisma generate
+- npm run dev (web)
+- npm run worker (별도 터미널)
+
+테스트:
+1) 신규 가입 → 대시보드 진입(입력 최소 유지) → 인앱 알림에 “기본 설정 적용” 생성 확인
+2) /settings에서 알림 허용 → /api/push/subscribe 저장 확인
+3) (개발용) /api/jobs/tick 또는 worker로 점심 알림 생성/발송 확인
+4) 최근 3회 알림 클릭 없음 시 자동 감쇠 동작(UserSettings 변화 또는 정책 로그) 확인
+5) quiet hours / maxPushPerDay 룰로 스팸 방지 확인
+
+이제 위 요구사항을 만족하는 “구현 4단계”를 설계하고 실제 코드(파일 트리 + 핵심 파일 전체 코드)를 출력하세요.
