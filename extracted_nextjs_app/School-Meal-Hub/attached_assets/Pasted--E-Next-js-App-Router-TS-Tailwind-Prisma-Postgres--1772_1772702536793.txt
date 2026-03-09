@@ -1,0 +1,198 @@
+당신은 프로덕션 경험이 풍부한 시니어 풀스택 엔지니어입니다.
+우리는 급식E를 Next.js(App Router)+TS+Tailwind+Prisma+Postgres로 개발 중이며,
+1단계에서 세션 쿠키 기반 Auth와 /dashboard 보호를 만들었고,
+2단계에서 School 매핑 + NEIS 급식 + 피드백→포인트 + 랭킹까지 구현해 둔 상태입니다.
+
+이제 “구현 3단계”를 설계하고 실제 코드를 수정/추가해 완성하세요.
+3단계 목표는: (1) 클린플레이트 사진 업로드, (2) (Mock) AI 판정/상태머신, (3) 승인 시 포인트 지급, (4) 관리자 리뷰 화면/권한 입니다.
+UI 톤은 Apple처럼 미니멀: 흰 배경, 얇은 구분선, 절제된 블루 포인트, 여백/타이포 중심. 과한 그림자/애니메이션 금지.
+
+[중요 출력 규칙]
+- 장문 설명 금지. “바로 구현 가능한 산출물” 중심으로 출력.
+- 반드시 포함:
+  1) 변경/추가되는 파일 트리
+  2) Prisma schema 변경 전체 코드 + migration 방법
+  3) 추가/수정된 핵심 파일 전체 코드(복붙 가능)
+  4) 로컬 실행/테스트 시나리오(짧게)
+- 기존 코드가 있다고 가정하되, patch가 아니라 “각 핵심 파일은 완전한 코드”로 제시.
+- 환경변수는 .env.example에 추가.
+- 이미지 저장은 개발/로컬에서도 안정적으로 동작해야 함.
+
+=====================================================
+1) 저장소(이미지 업로드) 아키텍처: S3 호환 + 로컬 MinIO
+=====================================================
+- 프로덕션 대비를 위해 S3 호환 API를 사용.
+- 로컬 개발은 docker-compose에 MinIO 서비스를 추가해서 버킷을 사용.
+- Next.js 서버에서만 S3 자격증명을 사용(클라이언트 노출 금지).
+
+필수 env:
+- S3_ENDPOINT (예: http://localhost:9000)
+- S3_REGION (예: us-east-1)
+- S3_ACCESS_KEY_ID
+- S3_SECRET_ACCESS_KEY
+- S3_BUCKET (예: gupsik-e)
+- S3_PUBLIC_URL (예: http://localhost:9000/gupsik-e)  // 개발용 단순 공개 URL
+
+서버 유틸:
+- src/server/storage.ts
+  - uploadImage(fileBuffer, contentType, key) -> { url, key }
+  - (선택) generateKey(userId, date, originalName)
+
+업로드 제한:
+- 이미지 MIME만 허용: image/jpeg, image/png, image/webp
+- 최대 5MB
+- EXIF/메타데이터 처리는 다음 단계로 미룸(주석으로 확장 포인트만)
+
+=====================================================
+2) DB 모델(Prisma) 추가: 클린플레이트 상태머신 + 관리자 권한
+=====================================================
+A) User에 role 추가(간단 권한)
+- role enum: USER | ADMIN
+- 기본값 USER
+- admin 전용 페이지/API는 role=ADMIN만 접근
+
+B) CleanPlateSubmission 테이블 추가
+- id (uuid)
+- userId (relation)
+- schoolId (relation)
+- date (date)                  // 인증 날짜(보통 오늘)
+- imageUrl (string)
+- imageKey (string)            // S3 key
+- status enum: PENDING | AUTO_APPROVED | APPROVED | REJECTED
+- aiScore (float nullable)     // Mock AI 점수(0~1)
+- aiResult (Json nullable)     // Mock 결과 상세
+- pointsAwarded (int default 0) // 중복 지급 방지용(승인 시 설정)
+- reviewNote (string nullable)
+- reviewedByUserId (uuid nullable, relation User)
+- reviewedAt (datetime nullable)
+- createdAt
+
+제약:
+- (userId, date) unique  // 하루 1회 인증 기본 룰
+- 인덱스: (schoolId, date), (status, createdAt)
+
+C) PointLedger는 기존 것을 재사용하되 reason에 아래를 사용:
+- CLEANPLATE_AUTO_APPROVED
+- CLEANPLATE_APPROVED
+- CLEANPLATE_REJECTED (선택)
+포인트 정책(이번 단계 고정값):
+- 승인(자동/수동) 시 +100P
+- Reject는 0P
+(추후 이벤트/보너스는 다음 단계로)
+
+=====================================================
+3) (Mock) AI 판정 로직: 추후 실제 모델로 교체 가능한 구조
+=====================================================
+- src/server/cleanplate-ai.ts
+  - analyzeCleanPlate(imageUrl: string) -> { score: number, verdict: "APPROVE"|"REVIEW"|"REJECT", details: any }
+- 지금은 Mock:
+  - score는 pseudo-random 또는 간단 규칙
+  - verdict:
+    - score >= 0.85 => APPROVE(자동승인)
+    - 0.5~0.85 => REVIEW(관리자 검토)
+    - < 0.5 => REJECT(자동거절 또는 관리자 검토; 이번 단계는 REJECT로 처리)
+
+중요:
+- “AI 자동 승인”이 나가도 포인트는 1회만 지급(트랜잭션 + pointsAwarded 체크)
+
+=====================================================
+4) API 라우트(백엔드) 추가
+=====================================================
+A) POST /api/cleanplate/upload
+- multipart/form-data:
+  - file: 이미지 파일(필수)
+  - date: YYYY-MM-DD (옵션, 없으면 서버에서 오늘로)
+- 세션 필수
+- 처리:
+  1) 오늘(또는 date) 기준으로 (userId, date) 중복이면 에러
+  2) S3(MinIO)에 업로드 -> imageUrl, imageKey 확보
+  3) CleanPlateSubmission 생성 status=PENDING
+  4) 바로 Mock AI 분석 실행:
+     - verdict=APPROVE면 status=AUTO_APPROVED로 변경 + 포인트 지급(+100)까지 한 번에 처리
+     - verdict=REVIEW면 status=PENDING 유지
+     - verdict=REJECT면 status=REJECTED로 변경(포인트 없음)
+- 응답:
+  { ok:true, submission:{ id, status, imageUrl, date }, pointsDelta, newPoints }
+
+B) GET /api/cleanplate/today
+- 오늘 기준 내 제출 상태 반환(없으면 null)
+
+C) GET /api/cleanplate/history?days=7
+- 최근 N일 제출 목록(상태/날짜/포인트)
+
+D) (ADMIN) GET /api/admin/cleanplate?status=PENDING
+- PENDING 목록(학교 단위로만 보여주기: 같은 schoolId)
+- 개인정보 최소화: “13번” 형태로만 표시할 수 있도록 user의 studentNumber만 제공(실명 금지)
+
+E) (ADMIN) POST /api/admin/cleanplate/{id}/review
+- body: { action: "APPROVE"|"REJECT", note?: string }
+- 승인 시:
+  - status=APPROVED, reviewedAt, reviewedByUserId, reviewNote 저장
+  - pointsAwarded==0이면 +100 지급(ledger 기록 + user.points 증가) 트랜잭션
+- 거절 시:
+  - status=REJECTED, reviewedAt 등만 저장(포인트 없음)
+
+에러 응답 형식 통일:
+- { ok:false, error:{ code, message } }
+
+=====================================================
+5) 프론트엔드(UI)
+=====================================================
+A) /dashboard 버튼 연결
+- “클린플레이트 인증하기” -> /cleanplate 로 이동
+
+B) /cleanplate 페이지 신규(로그인 필요)
+- 오늘 상태 카드:
+  - 제출 전: 업로드 폼(파일 선택 + 제출 버튼)
+  - 제출 후: 이미지 썸네일(최소), 상태 배지(PENDING/APPROVED/REJECTED), 포인트 결과 표시
+- 최근 기록(최근 7일) 리스트(미니멀)
+- 업로드 UX:
+  - 업로드 중 로딩 표시(절제된 spinner)
+  - 에러는 한 줄 빨간 텍스트로
+
+C) /admin/cleanplate 페이지 신규(ADMIN만)
+- 상단: “대기중 인증(PENDING)” 타이틀 + 학교명 표시
+- 리스트/테이블:
+  - 날짜, 학생표시(“13번”), 미리보기 링크(또는 썸네일), 액션(승인/거절)
+- 승인/거절은 모달(노트 입력 optional) 또는 인라인 버튼(둘 중 하나 선택)
+- 액션 후 리스트 갱신
+
+D) 미들웨어 보호
+- /cleanplate, /admin/* 보호
+- /admin은 role 체크 필요(세션으로 userId를 읽고 DB에서 role 확인)
+  - 성능상 role을 세션에 포함시키는 방식도 가능(선택)
+
+=====================================================
+6) 반드시 출력할 산출물
+=====================================================
+- 변경된 prisma/schema.prisma 전체
+- docker-compose.yml(기존 postgres + minio 추가) 전체
+- .env.example 업데이트 전체
+- 서버 유틸: src/server/storage.ts, src/server/cleanplate-ai.ts
+- API route들 전체:
+  - src/app/api/cleanplate/upload/route.ts
+  - src/app/api/cleanplate/today/route.ts
+  - src/app/api/cleanplate/history/route.ts
+  - src/app/api/admin/cleanplate/route.ts
+  - src/app/api/admin/cleanplate/[id]/review/route.ts
+- 프론트 페이지 전체:
+  - src/app/cleanplate/page.tsx
+  - src/app/admin/cleanplate/page.tsx
+  - 기존 src/app/dashboard/page.tsx 수정본(버튼 링크)
+- 권한/세션 유틸 변경이 필요하면 해당 파일 전체 코드도 포함
+
+=====================================================
+7) 로컬 실행/테스트 시나리오(짧게)
+=====================================================
+- docker compose up (postgres + minio)
+- prisma migrate dev + prisma generate
+- dev 서버 실행
+- 일반 유저:
+  1) 로그인 -> /cleanplate 업로드 -> status/포인트 확인
+  2) 하루 1회 제한 확인(두 번 업로드 시 에러)
+- 관리자:
+  1) ADMIN role 유저로 로그인
+  2) /admin/cleanplate에서 PENDING 승인/거절
+  3) 승인 시 포인트 지급/중복지급 방지 확인
+
+이제 위 요구사항을 만족하는 “구현 3단계”를 설계하고 실제 코드(파일 트리 + 핵심 파일 전체 코드)를 출력하세요.
