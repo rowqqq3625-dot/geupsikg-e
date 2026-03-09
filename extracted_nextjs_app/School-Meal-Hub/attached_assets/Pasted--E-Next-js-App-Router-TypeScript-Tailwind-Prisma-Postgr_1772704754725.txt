@@ -1,0 +1,306 @@
+당신은 프로덕션 경험이 풍부한 시니어 풀스택 엔지니어입니다.
+우리는 급식E를 Next.js(App Router)+TypeScript+Tailwind+Prisma+Postgres로 개발 중이며,
+1단계(세션 Auth/보호), 2단계(NEIS+피드백/포인트/랭킹), 3단계(클린플레이트 업로드+승인+포인트),
+4단계(입력 최소·개인화 최대 원칙 고정 + 자동세팅 파이프라인 + 인앱알림/푸시 + 스팸방지 정책 + 워커)까지 완료된 상태입니다.
+
+이제 “구현 5단계”를 설계하고 실제 코드를 수정/추가해 완성하세요.
+5단계 목표는: 음식 양보(Food Buddy) 매칭을 안전하고 사용자친화적으로 운영 가능한 “완전 구동 엔진”으로 만든다.
+- 버튼 한 번(입력 최소)으로 매칭 참여
+- 같은 학교/같은 학년(기본) 내에서 자동 매칭
+- 익명 채팅으로 시작 → 상호 동의 시에만 최소 정보(학번 정도) 공개
+- 신고/차단/레이트리밋/모더레이션까지 포함(학교 서비스로서 안전이 최우선)
+- 매칭 성공 시 포인트 지급(장부 기록 + 중복 방지)
+- 4단계 알림 엔진과 연결: 매칭/메시지/동의요청이 인앱알림(+가능하면 푸시)로 전달
+
+=====================================================
+0) 제품 원칙(반드시 구현 설계에 반영)
+=====================================================
+A. 입력 최소, 행동 유도 최대
+- 사용자는 “적게 먹을래요 / 많이 먹을래요” 둘 중 하나만 탭하면 끝(추가 폼 최소화).
+- 개인화는 자동: schoolId/grade/classNum은 세션에서 확보, groupKey는 서버에서 계산.
+
+B. 안전 최우선(학교용)
+- 기본은 익명(닉네임/학번 비공개).
+- 유저가 원할 때만 “학번 공개 요청”을 보내고, 상대가 동의해야 공개됨(양방향 동의).
+- 신고/차단은 항상 1탭으로 가능.
+- 메시지 레이트리밋 + 금칙어(최소) + 운영자 모더레이션 도구 제공.
+
+C. 스팸/남용 방지
+- 한 사용자당 “활성 매칭 1개” 제한(기본).
+- 매칭 큐 재참여는 쿨다운(예: 5분).
+- 채팅은 텍스트만(이미지/링크는 6단계 이후), 연락처 공유 유도 금지 문구 및 필터.
+
+=====================================================
+1) 범위 정의(이번 5단계에서 반드시 완성할 것)
+=====================================================
+필수 기능:
+1) 매칭 큐 참가/이탈
+2) 자동 매칭 생성(트랜잭션 안전)
+3) 매칭 방 생성 후 익명 채팅(텍스트)
+4) 상호 동의 기반 “학번 공개” 흐름
+5) 매칭 완료 처리(완료 버튼) + 포인트 지급(+50P 또는 +100P) + 중복 지급 방지
+6) 신고/차단 + 관리자 모더레이션 페이지
+7) 알림 연동(인앱 알림은 필수, 푸시는 구독 있으면)
+
+비범위(다음 단계로 미룸):
+- 지도/위치 공유, 실명 공개, 외부 연락처 교환
+- 음성/영상, 이미지 전송
+- 고급 AI 위험탐지(일단 규칙 기반)
+
+=====================================================
+2) DB 모델(Prisma) 추가/확장
+=====================================================
+기존(User, School, PointLedger, Notification, UserEvent 등)은 유지한다고 가정.
+
+A) BuddyQueue (매칭 대기열)
+- id (uuid)
+- userId (unique, relation)          // 한 번에 1개 큐만
+- schoolId (relation)
+- grade (int)                         // 기본: 같은 학년 매칭
+- classNum (int nullable)             // 옵션: 같은 반 우선(정책으로)
+- preference enum: LESS | MORE        // 적게/많이
+- status enum: WAITING | MATCHED | CANCELLED
+- createdAt, updatedAt
+인덱스: (schoolId, grade, preference, createdAt)
+
+B) BuddyMatch (매칭 결과/방)
+- id (uuid)
+- schoolId (relation)
+- grade (int)
+- userLessId (relation User)
+- userMoreId (relation User)
+- status enum: ACTIVE | COMPLETED | CANCELLED | EXPIRED
+- completedAt (datetime nullable)
+- pointsAwarded (int default 0)       // match 단위로 1회 지급(양쪽 지급은 ledger로 기록)
+- createdAt
+유니크/제약:
+- userLessId와 userMoreId 조합 중복 방지(선택)
+- ACTIVE 상태에서 각 user는 동시에 1개 match만(논리 제약은 트랜잭션으로 보장)
+
+C) BuddyMessage (채팅 메시지)
+- id (uuid)
+- matchId (relation)
+- senderId (relation User)
+- body (string)                       // 길이 제한(예: 300자)
+- createdAt
+인덱스: (matchId, createdAt), (senderId, createdAt)
+
+D) BuddyRevealConsent (학번 공개 동의)
+- id (uuid)
+- matchId (relation)
+- requesterId (relation User)
+- responderId (relation User)
+- status enum: PENDING | ACCEPTED | REJECTED
+- createdAt, respondedAt(nullable)
+유니크: (matchId, requesterId, responderId)  // 중복 요청 방지
+
+E) UserBlock (차단)
+- id (uuid)
+- blockerId (relation User)
+- blockedId (relation User)
+- createdAt
+유니크: (blockerId, blockedId)
+
+F) UserReport (신고)
+- id (uuid)
+- reporterId (relation User)
+- reportedUserId (relation User)
+- matchId (relation BuddyMatch nullable)
+- messageId (relation BuddyMessage nullable)
+- reason enum: HARASSMENT | SPAM | PRIVACY | INAPPROPRIATE | OTHER
+- detail (string nullable, max 300)
+- status enum: OPEN | REVIEWED | ACTIONED | DISMISSED
+- createdAt, updatedAt
+인덱스: (status, createdAt), (reportedUserId, createdAt)
+
+G) ModerationAction (관리자 조치)
+- id (uuid)
+- adminId (relation User)
+- targetUserId (relation User)
+- reportId (relation UserReport nullable)
+- action enum: WARN | SUSPEND_MATCHING_7D | SUSPEND_ACCOUNT_7D | BAN
+- note (string nullable)
+- createdAt
+(유저 정지 필드는 User에 추가해도 됨: matchingSuspendedUntil, accountSuspendedUntil)
+
+추가(User 확장):
+- matchingSuspendedUntil (datetime nullable)
+- accountSuspendedUntil (datetime nullable)
+- role(USER|ADMIN)는 3~4단계에서 이미 있다고 가정(없으면 추가)
+
+=====================================================
+3) 매칭 엔진(핵심 로직) — 트랜잭션 안전 설계
+=====================================================
+서버 유틸: src/server/buddy-matching.ts
+- joinQueue(userId, preference)
+  - 차단/정지 체크
+  - 기존 ACTIVE match 존재하면 에러
+  - 기존 queue가 WAITING이면 업데이트(중복 방지)
+  - 참가 성공 후 “즉시 매칭 시도”를 수행(동기 or job enqueue)
+
+- tryMatch(schoolId, grade)
+  - WAITING 큐에서 LESS 1명 + MORE 1명을 createdAt 오래된 순으로 매칭
+  - 반드시 DB 트랜잭션으로:
+    1) 양쪽 큐 row를 lock(select for update) 또는 Prisma transaction으로 안전하게 선택
+    2) BuddyMatch 생성
+    3) 두 큐 status=MATCHED로 변경
+    4) 알림 생성(양쪽에 match 생성 알림)
+  - 경쟁 조건에서도 중복 매칭이 생기지 않게 구현
+
+- leaveQueue(userId)
+  - WAITING이면 CANCELLED 처리
+
+- expireMatches job(워커)
+  - ACTIVE match가 일정 시간(예: 2시간) 이상 진행되고 메시지/완료 없으면 EXPIRED 처리
+  - 큐 자동 복귀는 하지 말고, 사용자에게 재참여 유도 알림
+
+=====================================================
+4) 메시징(채팅) 구현 정책 — “실시간 느낌” + 인프라 최소
+=====================================================
+- 별도 WebSocket 인프라 없이도 완전 구동 가능해야 함.
+- 구현 방식(권장):
+  - GET /api/buddy/match/{id}/messages?cursor=... 로 커서 기반 폴링(예: 3초 간격) 또는 SWR refresh
+  - POST /api/buddy/match/{id}/messages 로 메시지 전송
+- 레이트리밋:
+  - UserEvent 또는 BuddyMessage createdAt 기반으로
+    “최근 10초 내 3개 초과 금지” 같은 DB 기반 제한(서버리스에서도 안정)
+- 금칙어/연락처 필터(최소):
+  - 전화번호 패턴/카톡ID 유도 문구 등 간단 규칙으로 차단 또는 경고(정교화는 다음 단계)
+
+=====================================================
+5) API 라우트(백엔드) — 5단계 필수 목록
+=====================================================
+A) POST /api/buddy/join
+- body: { preference: "LESS"|"MORE" }
+- 세션 필수
+- joinQueue 실행 + tryMatch 실행(가능하면 즉시)
+- 응답: { ok:true, state:"WAITING"|"MATCHED", matchId? }
+
+B) POST /api/buddy/leave
+- WAITING 큐 이탈
+
+C) GET /api/buddy/status
+- 현재 상태 반환:
+  - WAITING이면 큐 정보
+  - ACTIVE match면 matchId, 상대 표시명(익명), reveal 상태 등
+
+D) GET /api/buddy/match/{id}
+- match 상세(내가 참여자인지 체크)
+- 상대 표시명은 기본 “??번”(학번 미공개면 “익명 학생”) 형태
+- 공개 동의가 완료되면 studentNumber만 노출(실명 금지)
+
+E) GET /api/buddy/match/{id}/messages?cursor=
+- 커서 기반 메시지 페이징
+
+F) POST /api/buddy/match/{id}/messages
+- body: { body: string }
+- 차단 관계/정지/레이트리밋 체크 후 저장
+- 저장 시 상대에게 Notification 생성(옵션으로 푸시)
+
+G) POST /api/buddy/match/{id}/reveal/request
+- 학번 공개 요청 생성(PENDING)
+- 상대에게 Notification 생성
+
+H) POST /api/buddy/match/{id}/reveal/respond
+- body: { action:"ACCEPT"|"REJECT" }
+- ACCEPT 시 해당 pair를 ACCEPTED로, 양쪽 모두 ACCEPTED 상태면 “학번 공개 활성화”로 처리
+
+I) POST /api/buddy/match/{id}/complete
+- 매칭 완료 처리(양측 중 1명이 먼저 눌러도 됨: 상태는 “상대 완료 대기”로 운영하거나,
+  간단히 1명 완료 버튼 → COMPLETED로 처리(정책 선택))
+- COMPLETED 시 트랜잭션으로:
+  - BuddyMatch.status=COMPLETED
+  - PointLedger 양쪽에 +100P(reason="BUDDY_MATCH_COMPLETED", refId=matchId)
+  - User.points += 100
+  - BuddyMatch.pointsAwarded 설정(중복 방지)
+
+J) POST /api/block
+- body: { blockedUserId }
+- UserBlock upsert, 해당 match가 ACTIVE면 CANCELLED 처리(옵션)
+- 차단 이후 메시지/요청 불가
+
+K) POST /api/report
+- body: { reportedUserId, matchId?, messageId?, reason, detail? }
+- 신고 생성 + 관리자 알림(인앱) 생성(ADMIN에게)
+
+(ADMIN)
+L) GET /api/admin/reports?status=OPEN
+- 신고 리스트(학교 단위로 필터: admin과 같은 schoolId만; 또는 전체 가능 정책 선택)
+- 개인정보 최소화
+
+M) POST /api/admin/reports/{id}/action
+- body: { action, note?, targetUserId }
+- 조치 기록 + 유저 정지 필드 업데이트
+
+에러 응답 형식 통일:
+- { ok:false, error:{ code, message } }
+
+=====================================================
+6) 프론트엔드(UI) — Apple-like, 사용자친화적 플로우
+=====================================================
+A) /dashboard
+- Food Buddy 카드의 “적게/많이” 버튼을 실제로 동작:
+  - 클릭 → /buddy 로 이동하면서 preference 전달(또는 즉시 join 요청)
+
+B) /buddy 페이지(로그인 필요)
+- 상태 기반 3가지 화면:
+  1) 미참여: 설명 2줄(안전/익명) + 버튼 2개(LESS/MORE)
+  2) 대기중: “매칭 중…” + 취소 버튼 + “왜 안전한가” 한 줄
+  3) 매칭됨: “매칭 완료” 카드 + “채팅으로 이동” 버튼
+- 입력 최소: 버튼만, 추가 폼 금지
+
+C) /buddy/match/[id] (채팅)
+- 상단: 상태(익명) + “학번 공개 요청” 버튼 + “신고/차단” 메뉴
+- 메시지 리스트(미니멀) + 입력창(텍스트만)
+- 안내 문구(작고 담백하게):
+  - “연락처/개인정보 공유는 권장하지 않아요.”
+- “완료” 버튼: 매칭이 실제로 끝났을 때 누르게 하며 포인트 지급 안내는 과장 없이
+
+D) /admin/moderation (또는 /admin/reports)
+- OPEN 신고 목록, 상세, 조치 버튼(WARN/SUSPEND/BAN)
+- 최소한의 운영 가능하도록 필수 정보만 표시
+
+E) 알림 연동(4단계 재사용)
+- 매칭 생성/메시지 도착/동의 요청/관리자 조치는 Notification 테이블에 저장
+- /notifications에서 확인 가능
+- 푸시 구독이 있으면 푸시도 발송(조용한 시간/빈도 정책 준수)
+
+=====================================================
+7) 보안/품질 체크리스트(이번 단계 필수)
+=====================================================
+- 세션 사용자 검증 + match 참여자 권한 체크(타인 match 접근 차단)
+- 차단 관계가 있으면 메시지/요청 API 전부 거부
+- 레이트리밋(DB 기반)
+- XSS 방지: 채팅 body는 서버에서 길이 제한, 클라에서 escape 렌더링(React 기본)
+- 트랜잭션으로 매칭 생성/포인트 지급 원자성 보장
+- 로그(UserEvent)에 주요 이벤트 기록:
+  - BUDDY_JOIN, BUDDY_MATCHED, BUDDY_MESSAGE_SENT, BUDDY_COMPLETE, REPORT_CREATED 등
+
+=====================================================
+8) 출력 산출물(반드시 포함)
+=====================================================
+- 변경/추가 파일 트리
+- prisma/schema.prisma 전체 + migrate 방법
+- 추가/수정된 API route 전체 코드
+- 서버 유틸 전체 코드:
+  - src/server/buddy-matching.ts
+  - src/server/buddy-policy.ts(선택: 매칭 범위/우선순위 정책)
+  - src/server/moderation.ts(선택)
+- 프론트 페이지 전체 코드:
+  - src/app/buddy/page.tsx
+  - src/app/buddy/match/[id]/page.tsx
+  - src/app/admin/reports/page.tsx (또는 moderation)
+  - src/app/dashboard/page.tsx 수정본
+- 로컬 실행/테스트 시나리오(짧게)
+
+=====================================================
+9) 로컬 실행/테스트 시나리오(짧게)
+=====================================================
+1) 유저 A(LESS) / 유저 B(MORE) 같은 학교/학년으로 가입/로그인
+2) A,B가 /buddy에서 각각 참가 → 자동 매칭 생성 확인
+3) 채팅 전송/수신(폴링) 확인 + 레이트리밋 확인
+4) 학번 공개 요청 → 상대 수락 시에만 “13번” 표시로 전환 확인
+5) 완료 버튼 → 양쪽 포인트 +100P 지급 + 장부 기록 확인(중복 지급 방지)
+6) 신고/차단 → 이후 메시지 불가, 관리자 페이지에서 신고 확인 및 정지 조치 확인
+
+이제 위 요구사항을 만족하는 “구현 5단계”를 설계하고 실제 코드(파일 트리 + 핵심 파일 전체 코드)를 출력하세요.
