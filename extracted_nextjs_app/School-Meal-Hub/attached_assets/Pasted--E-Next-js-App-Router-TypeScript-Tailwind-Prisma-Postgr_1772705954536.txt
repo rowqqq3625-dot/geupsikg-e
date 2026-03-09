@@ -1,0 +1,276 @@
+당신은 프로덕션 경험이 풍부한 시니어 풀스택 엔지니어입니다.
+우리는 급식E를 Next.js(App Router)+TypeScript+Tailwind+Prisma+Postgres로 개발 중이며,
+1단계(세션 Auth/보호), 2단계(NEIS+피드백/포인트/랭킹), 3단계(클린플레이트 인증),
+4단계(입력 최소·개인화 최대 원칙 + 자동세팅 + 인앱알림/푸시 + 스팸방지 + 워커),
+5단계(Food Buddy 매칭 엔진 + 익명 채팅 + 신고/차단/모더레이션)까지 완료된 상태입니다.
+
+이제 “구현 6단계”를 설계하고 실제 코드를 수정/추가해 완성하세요.
+6단계 목표는: 급식실 혼잡을 실시간으로 해결하는 ‘혼잡 예측 + 분산 유도 + 가상 줄서기(입장 예약) + 알림’ 엔진을 완전 구동시키는 것입니다.
+원문 계획서의 KPI: 대기시간을 의미 있게(예: 30~40%) 줄일 수 있는 구조를 만든다.
+
+=====================================================
+0) 제품 원칙(Δ2 포함, 반드시 반영)
+=====================================================
+A) 입력 최소, 개인화 최대
+- 사용자는 “체크인” 버튼 1회 또는 자동 감지 수준의 최소 행동만 한다.
+- 학교/학년/반 정보는 세션에서 자동, 그룹/스코프는 서버에서 자동 계산.
+
+B) 프라이버시 최우선(익명 집계)
+- 혼잡은 “개인”이 아니라 “집계”로만 표시한다.
+- 화면/관리자에서도 개인 행동 로그를 그대로 노출하지 않는다(필요 최소).
+- 체크인 이벤트는 익명화(또는 최소 식별) 저장 + 집계 스냅샷 중심으로 설계.
+
+C) 정확도보다 “유용함” 우선(점진적 고도화)
+- 6단계에서는 ML 모델이 아니라도 좋다.
+- 규칙 기반/통계 기반(요일/시간대 + 최근 유입)으로 “추천 입장 시간”과 “예상 대기시간”을 안정적으로 제공.
+- 실패 시 fallback(“현재는 혼잡 정보가 부족해요”)로 UX가 깨지지 않게.
+
+D) 스팸 방지/남용 방지
+- 체크인은 1~2분 단위 rate limit.
+- 예약(가상 줄서기)은 1인 1개 활성 예약, 노쇼 페널티(포인트/쿨다운)는 다음 단계로 확장 가능하되 구조는 깔끔하게 마련.
+
+=====================================================
+1) 6단계 범위(필수 완성)
+=====================================================
+필수:
+1) 익명 체크인(지금 급식실 가는 중/들어감/나옴) 이벤트 수집
+2) 실시간 혼잡 지표(현재 추정 대기시간, 혼잡도 단계)
+3) 추천 입장 시간(“12:18에 들어가면 줄 적음” 형태)
+4) 가상 줄서기/입장 예약(Time slot 기반) + “지금 들어가세요” 알림
+5) 관리자 대시보드(학교 운영용): 시간대별 혼잡 히트맵 + 예측 정확도/참여율 지표(최소 버전)
+6) 4단계 알림 엔진과 통합(인앱 알림 필수, 푸시는 구독 시)
+
+비범위(다음 단계):
+- BLE/와이파이/위치 기반 자동 감지(추후)
+- 고급 ML(딥러닝) 예측(추후)
+- 학교별 급식실 라인(라인 A/B), 게이트별 분리(추후)
+
+=====================================================
+2) 데이터 모델(Prisma) — 혼잡/예약 엔진
+=====================================================
+A) CafeteriaCheckinEvent (개인 이벤트: 최소 식별, 집계용 원천)
+- id (uuid)
+- userId (relation)                     // 저장은 하되, UI/관리자에서는 개인 단위 노출 금지
+- schoolId (relation)
+- eventType enum: INTENT | ENTER | EXIT  // INTENT: 가려는 중, ENTER: 입장, EXIT: 퇴장
+- createdAt
+인덱스: (schoolId, createdAt), (userId, createdAt)
+
+B) CrowdSnapshot (집계 스냅샷: 화면은 이걸 기반으로)
+- id (uuid)
+- schoolId (relation)
+- bucketStart (datetime)                // 예: 12:10:00
+- bucketMinutes (int default 5)         // 5분 버킷
+- intentCount (int)
+- enterCount (int)
+- exitCount (int)
+- activeEstimate (int)                  // 단순 추정: 누적 enter-exit 기반 등
+- createdAt
+유니크: (schoolId, bucketStart, bucketMinutes)
+
+C) WaitTimePrediction (예측 결과 캐시)
+- id (uuid)
+- schoolId (relation)
+- forTime (datetime)                    // 예측 기준 시각(또는 버킷)
+- waitMinutes (int)                     // 예상 대기시간
+- crowdLevel enum: LOW | MID | HIGH
+- recommendedEntryTime (datetime nullable)
+- method enum: BASELINE | BASELINE_PLUS_RECENT
+- createdAt
+유니크: (schoolId, forTime)
+
+D) QueueReservation (가상 줄서기/입장 예약)
+- id (uuid)
+- userId (relation)
+- schoolId (relation)
+- date (date)
+- slotStart (datetime)
+- slotEnd (datetime)
+- status enum: ACTIVE | USED | CANCELLED | EXPIRED
+- createdAt, updatedAt
+제약:
+- (userId, date)에서 ACTIVE는 1개만(트랜잭션으로 보장)
+- 인덱스: (schoolId, slotStart, status)
+
+E) CafeteriaConfig (학교별 설정: 관리자 최소 설정)
+- id (uuid)
+- schoolId (unique relation)
+- lunchStartTime (string default "11:30")
+- lunchEndTime (string default "13:30")
+- slotMinutes (int default 5)
+- maxReservationsPerSlot (int default 20)
+- createdAt, updatedAt
+
+※ UserSettings(4단계)와 연결:
+- 점심 알림 시간, quiet hours, maxPushPerDay는 재사용
+- 혼잡 알림은 기본 OFF(스팸 방지), 예약 성공/입장 타이밍 알림은 기본 ON
+
+=====================================================
+3) 혼잡 예측 알고리즘(6단계: 통계/규칙 기반)
+=====================================================
+서버 유틸: src/server/crowd-prediction.ts
+
+입력:
+- 최근 30~60분 CrowdSnapshot
+- 요일(dayOfWeek) + 분 단위(timeOfDay)
+- (선택) 지난 2주 같은 요일/시간대 평균 스냅샷
+
+출력:
+- 현재 waitMinutes
+- crowdLevel(LOW/MID/HIGH)
+- recommendedEntryTime(다음 30분 내 가장 낮은 버킷)
+
+기본 모델(권장):
+1) Baseline: 요일+시간대 평균 활성 추정(activeEstimateAvg)
+2) Recent adjustment: 최근 2~3 버킷의 intent/enter 변화량으로 가중 보정
+3) waitMinutes 변환: activeEstimate를 “처리량(throughput)”으로 나눠 추정
+   - throughput은 초기에는 상수(예: 분당 10명)로 시작하고,
+     추후 exitCount 기반으로 학교별 자동 학습 가능하도록 확장 포인트 주석만
+
+Fallback:
+- 데이터 부족 시 waitMinutes=null, crowdLevel=MID, recommendedEntryTime=null로 반환하고
+  UI는 “정보가 아직 부족해요. 체크인하면 더 정확해져요.”로 유도
+
+=====================================================
+4) 백그라운드 잡/워커(필수)
+=====================================================
+4단계에서 만든 worker 구조를 재사용한다(필수).
+
+워크 플로우:
+A) Snapshot builder (매 1분 또는 2분)
+- 최근 이벤트를 5분 버킷으로 집계해 CrowdSnapshot upsert
+
+B) Predictor (매 2~5분)
+- school별로 WaitTimePrediction upsert
+
+C) Reservation notifier (매 1분)
+- slotStart가 임박(예: 2~3분 전)한 ACTIVE 예약자에게 인앱 알림 생성 + 푸시(가능 시)
+  메시지 예: “지금 들어가면 좋아요. 예약 시간이 곧 시작돼요.”
+
+D) Daily warm-up (매일 아침)
+- CafeteriaConfig 없는 학교는 기본값 생성(자동 세팅)
+- 혼잡 예측에 필요한 기본 파라미터 초기화
+
+=====================================================
+5) API 라우트(백엔드) — 6단계 필수
+=====================================================
+A) POST /api/crowd/checkin
+- body: { eventType: "INTENT"|"ENTER"|"EXIT" }
+- 세션 필수
+- rate limit: 동일 user의 동일 eventType은 최소 60초 간격(정책)
+- 저장 후 응답: { ok:true }
+
+B) GET /api/crowd/status
+- 세션 user의 schoolId 기준
+- 현재 WaitTimePrediction(forTime=now 근사) + 최근 스냅샷 요약 반환
+- 응답: { ok:true, waitMinutes, crowdLevel, recommendedEntryTime, lastUpdatedAt }
+
+C) GET /api/crowd/recommendation
+- 다음 30분 추천 버킷 리스트(최대 6개)
+- UI용: “12:10(혼잡) / 12:18(여유)” 같은 형태
+
+D) POST /api/queue/reserve
+- body: { slotStart } (서버가 slotEnd 계산)
+- ACTIVE 예약 1개 제한(트랜잭션)
+- 슬롯 정원(maxReservationsPerSlot) 초과 시 에러
+- 성공 시 인앱 알림 생성(“예약 완료”)
+
+E) POST /api/queue/cancel
+- 내 ACTIVE 예약 cancel
+
+F) GET /api/queue/me
+- 오늘 내 예약 상태 + 다음 알림 예정 시각
+
+(ADMIN)
+G) GET /api/admin/crowd/overview?date=YYYY-MM-DD
+- 시간대별 snapshot/prediction 요약(히트맵 데이터)
+- 개인 이벤트 raw는 제공하지 말 것(집계만)
+
+H) PUT /api/admin/cafeteria-config
+- lunchStart/end, slotMinutes, maxReservationsPerSlot 수정
+- Zod validation
+
+에러 응답 형식 통일:
+- { ok:false, error:{ code, message } }
+
+=====================================================
+6) 프론트엔드(UI) — 사용자 친화적(입력 최소)
+=====================================================
+A) /dashboard 카드 연결
+- “혼잡” 카드에 실데이터 표시:
+  - “예상 대기시간 12분”
+  - “추천 입장 12:18”
+  - 버튼: “지금 체크인” (한 번 탭)
+  - 버튼: “입장 예약” -> /queue
+
+B) /crowd 페이지 신규(로그인 필요)
+- 상단: 현재 혼잡 상태(LOW/MID/HIGH) + waitMinutes
+- 추천 시간 리스트(최대 6개)
+- 체크인 버튼 3개(미니멀):
+  - “가려는 중” (INTENT)
+  - “입장” (ENTER)
+  - “퇴장” (EXIT)
+- 안내 문구(짧게):
+  - “체크인은 익명 집계로만 사용돼요.”
+
+C) /queue 페이지 신규(로그인 필요)
+- 오늘 시간대 슬롯 리스트(예: 11:30~13:30, 5분 단위)
+- 추천 슬롯 강조(절제된 배경)
+- 내 예약이 있으면 “예약됨” 상태로 고정 + 취소 버튼
+- 예약 성공 시 인앱 알림 생성, slot 시작 직전 알림 자동 발송
+
+D) /admin/cafeteria 신규(ADMIN)
+- 오늘 혼잡 히트맵(텍스트 기반/간단 그래프 형태로도 OK)
+- 설정(점심시간/슬롯/정원) 편집
+- “체크인 참여율” 지표(대략: event 수 / 활성 사용자 수) 표시(과장 금지)
+
+E) 알림 통합(4단계 재사용)
+- 예약 성공/임박/만료, 혼잡 추천(옵션)을 Notification에 저장
+- /notifications에서 확인 가능
+
+=====================================================
+7) 보안/프라이버시/품질(필수)
+=====================================================
+- 체크인 이벤트는 관리자에 raw 제공 금지(집계만)
+- rate limit, 예약 1개 제한, 슬롯 정원 제한(트랜잭션)
+- quiet hours에서는 “혼잡 알림”은 보내지 않되, 예약 임박 알림은 예외로 허용할지 정책 명시(기본: quiet hours도 존중)
+- 모든 입력 Zod 검증
+- CrowdSnapshot/Prediction은 worker가 갱신하므로 API는 캐시된 결과를 빠르게 제공
+
+=====================================================
+8) 출력 산출물(반드시 포함)
+=====================================================
+- 변경/추가 파일 트리
+- prisma/schema.prisma 전체 + migrate 방법
+- worker 업데이트(스냅샷/예측/예약 알림 잡) 전체 코드
+- server 유틸:
+  - src/server/crowd-prediction.ts
+  - src/server/crowd-bucketing.ts(선택)
+- API route 전체 코드:
+  - /api/crowd/checkin
+  - /api/crowd/status
+  - /api/crowd/recommendation
+  - /api/queue/reserve
+  - /api/queue/cancel
+  - /api/queue/me
+  - /api/admin/crowd/overview
+  - /api/admin/cafeteria-config
+- 프론트 페이지 전체 코드:
+  - /crowd
+  - /queue
+  - /dashboard 수정본(혼잡 카드 실데이터 + 링크)
+  - /admin/cafeteria
+- .env.example 변경분(추가 env 없으면 명시)
+
+=====================================================
+9) 로컬 실행/테스트 시나리오(짧게)
+=====================================================
+1) 두 명 이상의 유저로 로그인 후 /crowd에서 INTENT/ENTER/EXIT 체크인 반복
+2) worker 실행 후 CrowdSnapshot/WaitTimePrediction이 생성되는지 확인
+3) /dashboard와 /crowd에서 waitMinutes/추천입장시간이 표시되는지 확인
+4) /queue에서 슬롯 예약 → “예약 완료” 인앱 알림 생성 확인
+5) slotStart 임박 시 “지금 들어가세요” 알림 생성/푸시(가능 시) 확인
+6) 관리자 /admin/cafeteria에서 히트맵/설정 변경 후 슬롯/예측이 반영되는지 확인
+7) rate limit/정원 초과/예약 1개 제한이 정상 동작하는지 확인
+
+이제 위 요구사항을 만족하는 “구현 6단계”를 설계하고 실제 코드(파일 트리 + 핵심 파일 전체 코드)를 출력하세요.
